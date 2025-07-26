@@ -3,3 +3,188 @@ git remote add origin https://github.com/<ton_nom_utilisateur>/predict-foot.git
 git add .
 git commit -m "Initial commit"
 git push -u origin master
+import streamlit as st
+import pandas as pd
+import os
+import joblib
+import matplotlib.pyplot as plt
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.preprocessing import LabelEncoder
+from math import pi
+
+# --- Configuration Streamlit ---
+st.set_page_config(page_title="Prédicteur Football", page_icon="⚽", layout="centered")
+
+st.markdown(
+    """
+    <style>
+        .big-title {
+            font-size:36px !important;
+            text-align:center;
+            font-weight:bold;
+            color:#c8102e;
+        }
+        .prob {
+            font-size:20px;
+            padding: 6px;
+        }
+        .prediction {
+            font-size:24px;
+            font-weight:bold;
+            color:green;
+            padding: 10px;
+        }
+    </style>
+    """, unsafe_allow_html=True
+)
+
+st.markdown('<p class="big-title">⚽ Prédicteur Football Multi-Ligue</p>', unsafe_allow_html=True)
+
+# --- Fonctions ---
+
+@st.cache_data
+def load_data(league_name):
+    path = f"ligues/{league_name}.csv"
+    df = pd.read_csv(path)
+
+    df.rename(columns={
+        'home_team': 'equipe_domicile',
+        'away_team': 'equipe_exterieur',
+        'home_goals': 'buts_domicile',
+        'away_goals': 'buts_exterieur'
+    }, inplace=True)
+
+    df['result'] = df.apply(lambda row: 1 if row['buts_domicile'] > row['buts_exterieur']
+                            else 0 if row['buts_domicile'] == row['buts_exterieur'] else 2, axis=1)
+    df['diff_buts'] = df['buts_domicile'] - df['buts_exterieur']
+    return df
+
+def moyenne_diff_buts_equipe(df, equipe, n=5):
+    dom = df[df['equipe_domicile'] == equipe]['diff_buts'].tail(n)
+    ext = -df[df['equipe_exterieur'] == equipe]['diff_buts'].tail(n)
+    return ((dom.mean() if not dom.empty else 0) + (ext.mean() if not ext.empty else 0)) / 2
+
+def estimer_diff_buts(df, equipe_domicile, equipe_exterieur, n=5):
+    return moyenne_diff_buts_equipe(df, equipe_domicile, n) - moyenne_diff_buts_equipe(df, equipe_exterieur, n)
+
+def entrainer_modele(df, league_name):
+    le_dom = LabelEncoder()
+    le_ext = LabelEncoder()
+    df['dom_encoded'] = le_dom.fit_transform(df['equipe_domicile'])
+    df['ext_encoded'] = le_ext.fit_transform(df['equipe_exterieur'])
+    X = df[['dom_encoded', 'ext_encoded', 'diff_buts']]
+    y = df['result']
+
+    model = RandomForestClassifier(n_estimators=100, random_state=42)
+    model.fit(X, y)
+
+    joblib.dump((model, le_dom, le_ext), f"models/{league_name}.pkl")
+    return model, le_dom, le_ext
+
+def charger_modele(league_name, df):
+    path = f"models/{league_name}.pkl"
+    if os.path.exists(path):
+        return joblib.load(path)
+    else:
+        return entrainer_modele(df, league_name)
+
+def predict_match(equipe_domicile, equipe_exterieur, df, model, le_dom, le_ext, n=5):
+    try:
+        diff = estimer_diff_buts(df, equipe_domicile, equipe_exterieur, n)
+        dom_enc = le_dom.transform([equipe_domicile])[0]
+        ext_enc = le_ext.transform([equipe_exterieur])[0]
+        X_new = [[dom_enc, ext_enc, diff]]
+        proba = model.predict_proba(X_new)[0]
+        pred = proba.argmax()
+        return {
+            "probas": {
+                "Victoire domicile": proba[1],
+                "Match nul": proba[0],
+                "Victoire extérieur": proba[2]
+            },
+            "prediction": pred,
+            "diff": diff
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+def afficher_radar(df, equipe1, equipe2):
+    stats = {
+        "moy_diff_buts": [],
+        "moy_buts_marques": [],
+        "moy_buts_encaissés": []
+    }
+    for equipe in [equipe1, equipe2]:
+        dom = df[df['equipe_domicile'] == equipe]
+        ext = df[df['equipe_exterieur'] == equipe]
+
+        moy_diff = moyenne_diff_buts_equipe(df, equipe)
+        moy_marques = pd.concat([dom['buts_domicile'], ext['buts_exterieur']]).mean()
+        moy_encaissés = pd.concat([dom['buts_exterieur'], ext['buts_domicile']]).mean()
+
+        stats["moy_diff_buts"].append(moy_diff)
+        stats["moy_buts_marques"].append(moy_marques)
+        stats["moy_buts_encaissés"].append(moy_encaissés)
+
+    labels = list(stats.keys())
+    equipe1_vals = [stats[label][0] for label in labels]
+    equipe2_vals = [stats[label][1] for label in labels]
+
+    angles = [n / float(len(labels)) * 2 * pi for n in range(len(labels))]
+    equipe1_vals += [equipe1_vals[0]]
+    equipe2_vals += [equipe2_vals[0]]
+    angles += [angles[0]]
+
+    fig, ax = plt.subplots(figsize=(5, 5), subplot_kw=dict(polar=True))
+    ax.plot(angles, equipe1_vals, label=equipe1, color='red')
+    ax.fill(angles, equipe1_vals, alpha=0.25, color='red')
+
+    ax.plot(angles, equipe2_vals, label=equipe2, color='blue')
+    ax.fill(angles, equipe2_vals, alpha=0.25, color='blue')
+
+    ax.set_xticks(angles[:-1])
+    ax.set_xticklabels(labels)
+    ax.set_title("📊 Comparaison radar")
+    ax.legend(loc='upper right', bbox_to_anchor=(1.1, 1.1))
+
+    st.pyplot(fig)
+
+# --- Interface utilisateur ---
+
+ligues_disponibles = [f.replace(".csv", "") for f in os.listdir("ligues") if f.endswith(".csv")]
+ligue_selectionnee = st.selectbox("🌍 Choisissez une ligue", ligues_disponibles)
+
+df = load_data(ligue_selectionnee)
+
+if st.button("🔁 Réentraîner le modèle"):
+    model, le_dom, le_ext = entrainer_modele(df, ligue_selectionnee)
+    st.success("Modèle réentraîné avec succès !")
+else:
+    model, le_dom, le_ext = charger_modele(ligue_selectionnee, df)
+
+teams = sorted(df['equipe_domicile'].unique())
+col1, col2 = st.columns(2)
+
+with col1:
+    equipe_dom = st.selectbox("🏠 Équipe à domicile", teams)
+
+with col2:
+    equipe_ext = st.selectbox("🚗 Équipe à l’extérieur", [t for t in teams if t != equipe_dom])
+
+if st.button("🔮 Prédire le résultat"):
+    res = predict_match(equipe_dom, equipe_ext, df, model, le_dom, le_ext)
+    if "error" in res:
+        st.error(res["error"])
+    else:
+        st.markdown("---")
+        st.subheader("📊 Probabilités de résultat")
+
+        st.markdown(f'<p class="prob">🏠 <b>{equipe_dom}</b> gagne : <b>{res["probas"]["Victoire domicile"]:.2%}</b></p>', unsafe_allow_html=True)
+        st.markdown(f'<p class="prob">🤝 Match nul : <b>{res["probas"]["Match nul"]:.2%}</b></p>', unsafe_allow_html=True)
+        st.markdown(f'<p class="prob">🚗 <b>{equipe_ext}</b> gagne : <b>{res["probas"]["Victoire extérieur"]:.2%}</b></p>', unsafe_allow_html=True)
+
+        st.markdown("---")
+        outcome = ["🤝 Match nul", f"🏆 Victoire de {equipe_dom}", f"🏆 Victoire de {equipe_ext}"]
+        st.markdown(f'<p class="prediction">🧠 Prédiction : {outcome[res["prediction"]]}<br>(Différence estimée : {res["diff"]:.2f})</p>', unsafe_allow_html=True)
+
+        afficher_radar(df, equipe_dom, equipe_ext)
